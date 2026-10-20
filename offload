@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""offload: keep heavy commands off a small laptop and send them to a bigger machine.
+
+A Claude Code hook. As a PreToolUse hook on Bash it refuses commands that need no laptop (installs, builds,
+test suites, headless browsers, video, OCR, bulk `claude -p`) and tells the agent how to run them on the
+remote host instead. As a SessionStart hook it adds a one-line reminder to every session.
+
+  offload hook            PreToolUse: read the hook JSON on stdin, exit 2 with a message to refuse
+  offload remind          SessionStart: print the reminder
+  offload check CMD...    print what the hook would say about CMD (exit 2 = refused)
+
+A command runs locally anyway when it starts with MAC_OK=1 (the agent should say why), when it already goes
+through ssh/scp/rsync, or when it matches an `allow` pattern in the config. The hook never blocks on its own
+error.
+
+Config: ~/.config/offload/config.json (OFFLOAD_CONFIG overrides), all keys optional:
+  {"host": "xps", "remote_dir": "~/src", "local_name": "this Mac",
+   "needs_local": "the agent Chrome, the phone, secrets, Xcode",
+   "heavy": ["^my-big-tool\\b"], "allow": ["^npm test\\b"], "swap_warn": 50}
+Env OFFLOAD_HOST overrides host. OFFLOAD_OFF=1 turns the hook off.
+"""
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+
+OVERRIDE = "MAC_OK"
+
+# Each rule: (what it is, regex matched against one simple command, from its first word).
+HEAVY = [
+    ("a package install", r"^(npm|pnpm|yarn|bun)\s+(install|i|ci|add)\b"),
+    ("a build", r"^(npm|pnpm|yarn|bun)\s+(run\s+)?(build|dev|start|test|t)\b"),
+    ("a browser test run", r"^(npm|pnpm|yarn|bun)\s+(exec|x)\s+(playwright|lighthouse)\b"),
+    ("a JS tool run", r"^(npx|bunx|pnpx)\s+(-y\s+|--yes\s+)?(playwright|lighthouse|next|vite|tsc|astro|jest|vitest|wrangler\s+dev)\b"),
+    ("a Go build or test", r"^go\s+(build|test|vet|generate|install)\b"),
+    ("a Rust build", r"^cargo\s+(build|test|run|bench|install)\b"),
+    ("a test suite", r"^(pytest|py\.test)\b"),
+    ("a test suite", r"^python3?(\.\d+)?\s+(-\S+\s+)*-m\s+pytest\b"),
+    ("a Python install", r"^(pip3?|python3?(\.\d+)?\s+-m\s+pip|uv\s+pip)\s+install\b"),
+    ("a Python env sync", r"^uv\s+sync\b"),
+    ("a make run", r"^make\b(?!\s+-n\b)"),
+    ("a container", r"^(docker|podman)\s+(build|run|compose|up)\b"),
+    ("a container", r"^docker-compose\b"),
+    ("a browser run", r"^(playwright|lighthouse)\b"),
+    ("a headless browser", r"(?i)(chrome|chromium)\b.*\s--headless"),
+    ("video work", r"^ffmpeg\b"),
+    ("OCR or ML", r"^(whisper|tesseract|ocrmypdf)\b"),
+    ("a site build", r"^(hugo|jekyll)\b"),
+    ("a bulk model run", r"^claude\s+(.*\s)?(-p|--print)\b"),
+]
+
+# First words that mean the command already runs elsewhere.
+REMOTE = {"ssh", "scp", "rsync", "mosh", "sftp"}
+# Wrappers to look through to find the real command.
+WRAPPERS = {"sudo", "time", "nice", "nohup", "exec", "command", "caffeinate", "env"}
+SEPARATORS = {";", "&&", "||", "|", "&", "|&", "\n", "(", ")"}
+
+
+def load_config():
+    path = os.environ.get("OFFLOAD_CONFIG") or os.path.expanduser("~/.config/offload/config.json")
+    cfg = {}
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        pass
+    cfg.setdefault("host", "xps")
+    cfg.setdefault("remote_dir", "~/src")
+    cfg.setdefault("local_name", "this machine")
+    cfg.setdefault("needs_local", "a logged-in browser, attached devices, local secrets, Xcode")
+    cfg.setdefault("heavy", [])
+    cfg.setdefault("allow", [])
+    cfg.setdefault("swap_warn", 50)
+    if os.environ.get("OFFLOAD_HOST"):
+        cfg["host"] = os.environ["OFFLOAD_HOST"]
+    return cfg
+
+
+def drop_heredocs(cmd):
+    """Remove heredoc bodies: they are file content, not commands."""
+    lines, out, end = cmd.split("\n"), [], None
+    for ln in lines:
+        if end is not None:
+            if ln.strip() == end:
+                end = None
+            continue
+        out.append(ln)
+        m = re.search(r"<<-?\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?", ln)
+        if m:
+            end = m.group(1)
+    return "\n".join(out)
+
+
+def split_commands(cmd):
+    """Split a shell line into simple commands, quote-aware. Falls back to a plain split on error."""
+    cmd = drop_heredocs(cmd)
+    lex = shlex.shlex(cmd, posix=True, punctuation_chars=";&|()\n")
+    lex.whitespace = " \t\r"
+    lex.whitespace_split = True
+    out, cur = [], []
+    try:
+        for tok in lex:
+            if tok in SEPARATORS or set(tok) <= set(";&|()\n"):
+                if cur:
+                    out.append(cur)
+                cur = []
+            else:
+                cur.append(tok)
+    except ValueError:  # unbalanced quotes, heredoc bodies: check only the first line
+        first = cmd.split("\n", 1)[0]
+        return [part.split() for part in re.split(r"&&|\|\||;|\|", first) if part.strip()]
+    if cur:
+        out.append(cur)
+    return out
+
+
+def strip_prefix(words):
+    """Drop env assignments and wrappers. Returns (words, override_seen)."""
+    override = False
+    i = 0
+    while i < len(words):
+        w = words[i]
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w):
+            if w.split("=", 1) == [OVERRIDE, "1"]:
+                override = True
+            i += 1
+        elif w in WRAPPERS:
+            i += 1
+        elif w == "timeout" or w == "gtimeout":
+            i += 1
+            while i < len(words) and (words[i].startswith("-") or re.match(r"^\d+[smhd]?$", words[i])):
+                i += 1
+        else:
+            break
+    return words[i:], override
+
+
+def judge(cmd, cfg):
+    """Return (kind, simple_command) for the first heavy command, or None."""
+    if os.environ.get("OFFLOAD_OFF") == "1":
+        return None
+    rules = [(k, re.compile(p)) for k, p in HEAVY] + [("a heavy command", re.compile(p)) for p in cfg["heavy"]]
+    allow = [re.compile(p) for p in cfg["allow"]]
+    for words in split_commands(cmd):
+        words, override = strip_prefix(words)
+        if override:
+            return None  # the whole line was cleared to run here
+        if not words:
+            continue
+        if os.path.basename(words[0]) in REMOTE:
+            continue
+        line = " ".join(words)
+        if any(a.search(line) for a in allow):
+            continue
+        for kind, rx in rules:
+            if rx.search(line):
+                return kind, line
+    return None
+
+
+def swap_percent():
+    try:
+        out = subprocess.run(["sysctl", "-n", "vm.swapusage"], capture_output=True, text=True, timeout=2).stdout
+        total = float(re.search(r"total = ([\d.]+)M", out).group(1))
+        used = float(re.search(r"used = ([\d.]+)M", out).group(1))
+        return round(100 * used / total) if total else 0
+    except Exception:
+        return None
+
+
+def message(kind, line, cfg):
+    host, rdir = cfg["host"], cfg["remote_dir"].rstrip("/")
+    short = line if len(line) <= 80 else line[:77] + "..."
+    msg = [
+        f"offload: `{short}` is {kind}, and it does not need {cfg['local_name']}. Run it on {host}:",
+        f"  ssh {host} 'cd {rdir}/<repo> && git pull --ff-only && {short}'",
+        "Commit and push local edits first so the remote checkout has them. For anything over a few minutes use"
+        f" `ssh {host} systemd-run --user --unit=<name> --collect <script>` (or tmux) so it survives the ssh session,"
+        " then poll it. Put scripts with quotes in a file and scp them; don't inline them in the ssh string.",
+        f"Only if it truly needs {cfg['local_name']} ({cfg['needs_local']}), rerun it as"
+        f" `{OVERRIDE}=1 <command>` and say in one line why.",
+    ]
+    swap = swap_percent()
+    if swap is not None and swap >= cfg["swap_warn"]:
+        msg.append(f"Swap here is at {swap}%: even with {OVERRIDE}=1, prefer {host}.")
+    return "\n".join(msg)
+
+
+def reminder(cfg):
+    return (
+        f"Reminder (offload): {cfg['local_name']} only runs what needs it ({cfg['needs_local']}). Builds, installs,"
+        f" tests, scrapes, headless browsers, video, OCR, ML and bulk `claude -p` go to `ssh {cfg['host']}`"
+        f" (repos in {cfg['remote_dir']}). Heavy local Bash commands are refused unless prefixed {OVERRIDE}=1."
+    )
+
+
+def main(argv):
+    cfg = load_config()
+    sub = argv[1] if len(argv) > 1 else "hook"
+    if sub == "remind":
+        print(reminder(cfg))
+        return 0
+    if sub == "check":
+        hit = judge(" ".join(argv[2:]), cfg)
+        if hit:
+            print(message(*hit, cfg))
+            return 2
+        print("ok: runs here")
+        return 0
+    if sub == "hook":
+        try:
+            data = json.load(sys.stdin)
+            if data.get("tool_name", "Bash") != "Bash":
+                return 0
+            hit = judge(data.get("tool_input", {}).get("command", "") or "", cfg)
+        except Exception:
+            return 0  # never block on our own error
+        if hit:
+            sys.stderr.write(message(*hit, cfg) + "\n")
+            return 2
+        return 0
+    sys.stderr.write(__doc__)
+    return 2 if sub not in ("-h", "--help", "help") else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
